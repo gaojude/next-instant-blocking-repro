@@ -1,22 +1,18 @@
-import { lang } from 'next/root-params'
-
-// `[lang]` is a root param WITH generateStaticParams, so `en` is prebuilt.
+// `[lang]` is covered by generateStaticParams, so `en` is prebuilt (its value is known).
 export async function generateStaticParams() {
   return [{ lang: 'en' }]
 }
 
-// CONDITION ① — the root param is read with `await` OUTSIDE any <Suspense>.
-// For a *generated* route (/en) this resolves statically and is fine. For a
-// *fallback* route (see app/[lang]/[scope]/billing) the root param is deferred
-// to request time, so this read becomes a runtime read in the shell → it bails.
-export default async function RootLayout({ children }) {
-  const currentLang = await lang()
+// CONDITION ① — a generateStaticParams-covered param is read with `await` OUTSIDE
+// any <Suspense>. On a generated route (/en) it resolves statically and is fine.
+// On a fallback route (app/[lang]/[scope]/billing) every param is deferred to
+// request time, so this known value becomes a runtime read in the shell → bail.
+export default async function RootLayout({ children, params }) {
+  const { lang } = await params
   return (
-    <html lang={currentLang}>
-      <body>
-        <p data-testid="lang-value">lang: {currentLang}</p>
-        {children}
-      </body>
-    </html>
+    <>
+      <p data-testid="lang-value">lang: {lang}</p>
+      {children}
+    </>
   )
 }
