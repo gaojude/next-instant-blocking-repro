@@ -1,0 +1,10 @@
+node_modules
+.next
+test-results
+playwright-report
+*.log
+.DS_Store
+
+# Next.js auto-generated agent files
+AGENTS.md
+CLAUDE.md
