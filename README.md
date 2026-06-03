@@ -63,6 +63,7 @@ Expected only the `Loading…` skeleton; actual: the `testCookie` value leaks in
 ## Routes
 
 ```
+app/layout.js                   root layout (html/body)
 app/[lang]/layout.js            await params outside <Suspense>; [lang] in generateStaticParams → ['en']
 app/[lang]/page.js              /en — generated route
 app/[lang]/[scope]/billing/...  /en/s1/billing — FALLBACK ([scope] has no generateStaticParams); cookie sealed in <Suspense>
