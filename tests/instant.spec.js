@@ -1,53 +1,42 @@
-import { test } from '@playwright/test'
+import { test, expect } from '@playwright/test'
 import { instant } from '@next/playwright'
 
-async function setCookie(page) {
+// The bug: navigating to a FALLBACK route whose root layout reads a root param
+// with `await` outside <Suspense> makes the instant() lock commit a full runtime
+// render — so a cookie value that is correctly sealed behind <Suspense> leaks
+// into the static shell.
+//
+// This test asserts the CORRECT behavior (no leak). On the affected canary it
+// FAILS — that failure IS the repro.
+test('instant() lock must not leak the cookie value into the static shell', async ({
+  page,
+}) => {
   await page.context().addCookies([
-    { name: 'testCookie', value: 'LEAKED', domain: 'localhost', path: '/' },
+    { name: 'testCookie', value: 'super-secret', domain: 'localhost', path: '/' },
   ])
-}
 
-test('A2 -> BLOCKING leaf under fallback [scope]: leak?', async ({ page }) => {
-  await setCookie(page)
-  await page.goto('/en/s1')
-  await page.locator('[data-testid="scope-home-title"]').waitFor()
+  // A: a generated route.
+  await page.goto('/en')
+  await page.locator('[data-testid="home-title"]').waitFor()
 
-  let leaked = false
-  let text = ''
   await instant(page, async () => {
-    await page.click('#link-to-scope-blocking')
-    await page.waitForTimeout(2500)
-    const loc = page.locator('[data-testid="scope-blocking-value"]')
-    leaked = (await loc.count()) > 0
-    if (leaked) text = (await loc.first().textContent()) || ''
-  })
-  console.log(
-    `RESULT [canary.34 BLOCKING] leaked=${leaked} text=${JSON.stringify(text)}`
-  )
-})
+    // Navigate to B: /en/s1/billing (a fallback route).
+    await page.click('#to-billing')
 
-test('A2 -> SEALED leaf under fallback [scope]: leak?', async ({ page }) => {
-  await setCookie(page)
-  await page.goto('/en/s1')
-  await page.locator('[data-testid="scope-home-title"]').waitFor()
+    // The static shell commits (the title is static).
+    await page
+      .locator('[data-testid="billing-title"]')
+      .waitFor({ state: 'visible' })
+    await page.waitForTimeout(1000)
 
-  let leaked = false
-  let titleCommitted = false
-  await instant(page, async () => {
-    await page.click('#link-to-scope-cookies')
-    try {
-      await page
-        .locator('[data-testid="scope-cookies-title"]')
-        .waitFor({ timeout: 10000 })
-      titleCommitted = true
-    } catch {
-      titleCommitted = false
-    }
-    await page.waitForTimeout(800)
-    leaked =
-      (await page.locator('[data-testid="scope-cookie-value"]').count()) > 0
+    const secret = page.locator('[data-testid="secret"]')
+    const leakedText = (await secret.count()) ? await secret.textContent() : ''
+    console.log(`leaked under lock: ${JSON.stringify(leakedText)}`)
+
+    // Under the lock the sealed cookie value must not be present.
+    expect(
+      await secret.count(),
+      'cookie value leaked into the instant shell'
+    ).toBe(0)
   })
-  console.log(
-    `RESULT [canary.34 SEALED] titleCommitted=${titleCommitted} leaked=${leaked}`
-  )
 })

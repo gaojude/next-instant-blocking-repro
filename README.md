@@ -1,96 +1,144 @@
 # next-instant-blocking-repro
 
 Minimal repro: the Next.js **`instant()`** navigation-testing lock (from `@next/playwright`)
-**leaks dynamic data into the committed shell** when an **SSG bailout** happens at a **root
-param read** in a route that has a **fallback descendant segment**.
+**leaks dynamic data into the locked static shell** when a **root param is read with `await`
+outside `<Suspense>`** and the navigation target is a **fallback route**.
 
-Stack: `next@16.3.0-canary.34` (the version v0 ships), `cacheComponents: true` (PPR), React 19,
-`@next/playwright`.
+Stack: `next@16.3.0-canary.39` (latest published canary; also reproduces on `canary.34`, the
+version v0 ships), `cacheComponents: true` (PPR), React 19, `@next/playwright`.
 
-## TL;DR
+## The critical learning — two necessary conditions
 
-```
-root param [lang]  (generateStaticParams → ['en'])
-  └─ read with `await lang()` OUTSIDE <Suspense> in the root layout
-     + a descendant segment [scope] with NO generateStaticParams (fallback / on-demand)
-        + navigate A → B under instant() in `next dev`
-           → NEXT_STATIC_GEN_BAILOUT fires at the root-param read
-              → on canary.34 the lock commits a full runtime render → dynamic data LEAKS
-```
-
-`instant(page, fn)` is supposed to lock a client navigation to its prerendered **static shell**:
-under the lock you should only see static content + `<Suspense>` fallbacks; genuinely dynamic data
-is sealed until the lock releases. Here the dynamic value shows up **inside the lock**, which it
-must not.
-
-## The mechanism
-
-A descendant segment without `generateStaticParams` (`[scope]`) makes the route render **on
-demand** as a *fallback shell*. In a fallback shell the route params — **including root params** —
-are deferred to request time. So `await lang()` at the top of the root layout (outside any
-`<Suspense>`) is a runtime read in the shell → it triggers `NEXT_STATIC_GEN_BAILOUT`.
-
-- On **canary.34**: the bailout falls back to a full runtime render, and the `instant()` lock
-  commits *that* → every dynamic value on the page (even ones correctly behind `<Suspense>` in the
-  leaf) **leaks** into the locked shell.
-- On **canary.39**: the same bailout no longer commits a full render under the lock — the
-  navigation **bails/stalls** instead (no shell to commit). No leak, but the nav hangs.
-
-The intended pattern (see Next's own `test/e2e/app-dir/ppr-root-param-fallback`) is to read root
-params / `params` **inside `<Suspense>`** when a route can be a fallback, keeping the static chrome
-outside.
-
-## Version behavior
-
-| `next` version           | A → B under `instant()` (dev) | Outcome     |
-| ------------------------ | ----------------------------- | ----------- |
-| `16.3.0-canary.34` (v0)  | dynamic value commits under lock | **LEAK**    |
-| `16.3.0-canary.39`       | bails at `await lang()`, no shell | stall / bail |
-
-## Routes
+The leak happens **if and only if both** of these hold (proven by ablation, see below):
 
 ```
-/en              home (A)                                          — static
-/en/s1           scope home (A2)   [scope]=s1, no generateStaticParams (fallback)
-/en/s1/cookies   SEALED leaf  — cookies() INSIDE <Suspense>        — leaks on .34
-/en/s1/blocking  BLOCKING leaf — cookies() OUTSIDE <Suspense>
+①  an ancestor layout reads a ROOT PARAM with `await` OUTSIDE any <Suspense>
+       app/[lang]/layout.js →  const currentLang = await lang()   // next/root-params, top-level
+       └─ read it INSIDE <Suspense>, or don't read it      →  NO leak
+
+                              AND
+
+②  the navigation target is a FALLBACK route
+       a segment in its path has NO generateStaticParams, so it renders on demand
+       app/[lang]/[scope]/billing  →  [scope] has no generateStaticParams
+       └─ a fully-generated / direct route                 →  NO leak
 ```
 
-## The toggle
+Either one alone is harmless. Together they leak — even though the leaf's dynamic read is
+correctly behind `<Suspense>`.
 
-`app/[lang]/layout.js` reads the root param only when `READ_ROOT_PARAM=1`:
+### Why (mechanism)
 
-- `READ_ROOT_PARAM=1` → `await lang()` outside `<Suspense>` → **the leak** (on .34).
-- unset → root param not read in the layout → clean bail at the leaf, **no leak**.
+A **fallback** route is served from one shell shared across all param values, so **every param
+— including the root param — is handed in as a request-time promise (deferred)**. So
+`await lang()` at the top of the layout is a *runtime* read sitting in the static shell:
 
-This isolates the root-param read as the trigger.
+```
+fallback render → root param is deferred
+  → `await lang()` outside <Suspense> = runtime data in the shell
+     → NEXT_STATIC_GEN_BAILOUT
+        → the instant() lock commits a FULL runtime render of the subtree
+           → every dynamic value below leaks in — even ones correctly behind <Suspense>
+```
+
+For a *generated* route (`/en`) the same `await lang()` resolves statically, so there is no
+bailout and no leak. The fallback context is what turns the root-param read toxic.
 
 ## Run it
 
 ```bash
 pnpm install
-
-# automated probe (dev): prints leaked=true|false for the sealed + blocking leaves
-READ_ROOT_PARAM=1 pnpm exec next dev -p 3340 &      # start the leak variant
-pnpm exec playwright test --workers=1
-#   RESULT [canary.34 SEALED]   titleCommitted=true leaked=true   ← the leak
-#   RESULT [canary.34 BLOCKING] leaked=false
-
-# compare: canary.39 instead bails/stalls (no leak)
-#   bump next + @next/playwright to 16.3.0-canary.39, reinstall, repeat
+pnpm exec playwright test          # auto-starts `next dev` on :3340
 ```
+
+Expected: the test **FAILS** — and that failure is the repro:
+
+```
+leaked under lock: "testCookie: super-secret"
+✘ instant() lock must not leak the cookie value into the static shell
+  Error: cookie value leaked into the instant shell
+```
+
+The test navigates `/en` (generated) → `/en/s1/billing` (fallback) inside `instant()` and asserts
+the sealed cookie value is **not** in the locked shell. It is, so it fails.
 
 ### By hand
 
 ```
-1. READ_ROOT_PARAM=1 pnpm exec next dev -p 3340
-2. open  http://localhost:3340/en/s1
+1. pnpm exec next dev -p 3340
+2. open  http://localhost:3340/en
 3. Next devtools (bottom-left) → Instant Nav panel → Start Capturing   (acquires the lock)
-4. click "Go to scope cookies page"  (→ /en/s1/cookies)
-5. under the lock you should see ONLY  "Loading cookies..."  (the <Suspense> fallback);
-   on .34 the resolved  "testCookie: …"  value LEAKS in instead.
+4. click "Go to billing (fallback route)"
+5. under the lock you should see ONLY the "Loading…" skeleton;
+   instead the resolved "testCookie: …" value leaks in.
 ```
 
-> Requires `experimental.exposeTestingApiInProductionBuild` (set in `next.config.mjs`) for the
-> testing API, and `cacheComponents: true` for PPR / instant navigation. The `instant()` runtime
-> probe is only meaningful in `next dev` or against a build with the testing API exposed.
+## The fix
+
+Read the root param **inside `<Suspense>`** (keep static chrome outside), so the deferred read
+no longer sits in the shell. This matches Next's own
+[`test/e2e/app-dir/ppr-root-param-fallback`](https://github.com/vercel/next.js/tree/canary/test/e2e/app-dir/ppr-root-param-fallback)
+pattern.
+
+```diff
+  export default async function RootLayout({ children }) {
+-   const currentLang = await lang()
+-   return (
+-     <html lang={currentLang}>
+-       <body>
+-         <p>lang: {currentLang}</p>
+-         {children}
+-       </body>
+-     </html>
+-   )
++   return (
++     <html>
++       <body>
++         <Suspense fallback={null}>
++           <LangLine />
++         </Suspense>
++         {children}
++       </body>
++     </html>
++   )
+  }
++
++ async function LangLine() {
++   const currentLang = await lang()
++   return <p>lang: {currentLang}</p>
++ }
+```
+
+## Ablation (proof of necessity)
+
+`next dev`, client nav A→B under `instant()`, **sealed leaf** as the unambiguous probe, 4/4 per
+cell:
+
+| target          | ① read OUTSIDE `<Suspense>` | ① read INSIDE `<Suspense>` | ① not read |
+| --------------- | --------------------------- | -------------------------- | ---------- |
+| direct (¬②)     | no leak                     | no leak                    | no leak    |
+| **fallback (②)**| **LEAK**                    | no leak                    | no leak    |
+
+## Routes
+
+```
+app/[lang]/layout.js            root layout — CONDITION ① (await lang() outside <Suspense>), generateStaticParams → ['en']
+app/[lang]/page.js              A — /en, a generated route (link to billing)
+app/[lang]/[scope]/billing/...  B — /en/s1/billing, a FALLBACK route (CONDITION ②); cookie read sealed in <Suspense>
+```
+
+## v0 mapping
+
+```
+[variants]  generateStaticParams ✓                  ≈  [lang]   (generated root param)
+[scope]     NO generateStaticParams (fallback)       ≈  [scope]  (condition ②: billing is a fallback route)
+→ whichever ancestor reads the variants/locale root param with `await` outside <Suspense> = condition ①
+```
+
+## Version note
+
+Reproduces on every published canary tested — `16.3.0-canary.34` (v0) and `16.3.0-canary.39`
+(latest). On the unreleased `canary` HEAD the behavior changes from *leak* to *bail/stall*
+(no shell commits), so the dynamic no longer leaks — but the navigation hangs instead. Requires
+`cacheComponents: true`; `experimental.exposeTestingApiInProductionBuild` lets the `instant()`
+probe also work against a production build.

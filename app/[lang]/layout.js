@@ -1,29 +1,20 @@
 import { lang } from 'next/root-params'
 
-// Root param IS statically generated. Two modes via READ_ROOT_PARAM:
-//  - unset (v0-faithful): layout does NOT await the root param; any bail is at
-//    the leaf.
-//  - "1": layout `await lang()` OUTSIDE <Suspense> (the canary.39 stall case).
+// `[lang]` is a root param WITH generateStaticParams, so `en` is prebuilt.
 export async function generateStaticParams() {
   return [{ lang: 'en' }]
 }
 
+// CONDITION ① — the root param is read with `await` OUTSIDE any <Suspense>.
+// For a *generated* route (/en) this resolves statically and is fine. For a
+// *fallback* route (see app/[lang]/[scope]/billing) the root param is deferred
+// to request time, so this read becomes a runtime read in the shell → it bails.
 export default async function RootLayout({ children }) {
-  if (process.env.READ_ROOT_PARAM === '1') {
-    const currentLang = await lang()
-    return (
-      <html lang={currentLang}>
-        <body>
-          <p data-testid="lang-value">lang: {currentLang}</p>
-          {children}
-        </body>
-      </html>
-    )
-  }
+  const currentLang = await lang()
   return (
-    <html lang="en">
+    <html lang={currentLang}>
       <body>
-        <p data-testid="lang-value">lang: (unread)</p>
+        <p data-testid="lang-value">lang: {currentLang}</p>
         {children}
       </body>
     </html>
